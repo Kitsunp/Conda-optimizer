@@ -1,11 +1,17 @@
+import torch
+import math
 from torch.optim import Optimizer
+
 
 class Conda(Optimizer):
     """
-    Conda optimizer - Simplified to only 'std' projection type.
+    Conda optimizer with Cautious Weight Decay (CWD) support.
     
-    Based on official implementation from the paper.
+    Based on official Conda implementation with CWD integration.
     Applies Conda projection to 2D parameters, standard Adam to 1D parameters.
+    
+    CWD applies weight decay only where the optimizer update direction
+    aligns with the parameter sign (sign-selective regularization).
     """
     
     def __init__(
@@ -18,6 +24,7 @@ class Conda(Optimizer):
         correct_bias=True,
         update_proj_gap=500,
         scale=0.25,
+        use_cwd=True,  # Cautious Weight Decay
     ):
         if lr < 0.0:
             raise ValueError(f"Invalid learning rate: {lr} - should be >= 0.0")
@@ -36,6 +43,7 @@ class Conda(Optimizer):
             "correct_bias": correct_bias,
             "update_proj_gap": update_proj_gap,
             "scale": scale,
+            "use_cwd": use_cwd,
         }
         super().__init__(params, defaults)
 
@@ -86,7 +94,7 @@ class Conda(Optimizer):
                         exp_avg, exp_avg, state, group["update_proj_gap"]
                     )
                 
-                # Update second moment
+                # Update second moment (PROJECTED for 2D - critical for Conda stability)
                 exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
                 denom = exp_avg_sq.sqrt().add_(group["eps"])
 
@@ -98,18 +106,34 @@ class Conda(Optimizer):
                     bias_correction2 = 1.0 - beta2 ** state["step"]
                     step_size = step_size * math.sqrt(bias_correction2) / bias_correction1
 
-                # Compute normalized gradient
+                # Compute normalized gradient (in subspace for 2D)
                 norm_grad = exp_avg / denom
                 
-                # Project back (only for 2D parameters)
+                # Project back to parameter space (only for 2D parameters)
+                # This is the ACTUAL update that Conda will apply to parameters
                 if grad.ndim == 2 and "projector_ortho" in state:
                     norm_grad = self._project_back(norm_grad, state, group["scale"])
 
-                p.add_(norm_grad, alpha=-step_size)
-
-                # Weight decay
+                # ============ CWD INTEGRATION ============
+                # norm_grad is "u_t" in CWD Algorithm 1:
+                # - For 2D: includes full Conda geometry (project→normalize→project back)
+                # - For 1D: standard Adam update (exp_avg/denom)
+                
+                # Weight decay BEFORE parameter update (operates on p_t, not p_{t+1})
                 if group["weight_decay"] > 0.0:
-                    p.add_(p, alpha=(-group["lr"] * group["weight_decay"]))
+                    if group["use_cwd"]:
+                        # Cautious Weight Decay: only decay where sign(u_t) == sign(p_t)
+                        # Mask construction: 𝕀(u_t ⊙ x_t ≥ 0) from Algorithm 1
+                        mask = (norm_grad * p) >= 0
+                        # Apply WD only on masked coordinates
+                        p.add_(p * mask, alpha=(-group["lr"] * group["weight_decay"]))
+                    else:
+                        # Standard decoupled weight decay (AdamW-style)
+                        p.add_(p, alpha=(-group["lr"] * group["weight_decay"]))
+                # =========================================
+
+                # Apply Conda update: x_{t+1} = x_t - η_t * u_t
+                p.add_(norm_grad, alpha=-step_size)
                 
         return loss
     
