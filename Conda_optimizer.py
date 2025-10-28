@@ -5,13 +5,20 @@ from torch.optim import Optimizer
 
 class Conda(Optimizer):
     """
-    Conda optimizer with Cautious Weight Decay (CWD) support.
+    Conda (Column-Normalized Adam) optimizer with Cautious Weight Decay (CWD) support.
     
-    Based on official Conda implementation with CWD integration.
-    Applies Conda projection to 2D parameters, standard Adam to 1D parameters.
+    Conda applies SVD-based projection to 2D parameters (weight matrices) for improved
+    training stability and convergence in large language models. For 1D parameters
+    (biases, layer norms), it behaves as standard Adam.
     
-    CWD applies weight decay only where the optimizer update direction
-    aligns with the parameter sign (sign-selective regularization).
+    CWD is a sign-selective weight decay variant that only applies regularization
+    when the optimizer update direction aligns with the parameter sign, preserving
+    the original loss landscape while inducing better generalization.
+    
+    References:
+        - Conda paper: "Column-Normalized Adam for Training Large Language Models Faster"
+          (arXiv:2509.24218)
+        - CWD paper: "Cautious Weight Decay" (arXiv:2510.12402)
     """
     
     def __init__(
@@ -96,18 +103,23 @@ class Conda(Optimizer):
                 
                 # Update second moment (PROJECTED for 2D - critical for Conda stability)
                 exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
-                denom = exp_avg_sq.sqrt().add_(group["eps"])
 
                 state["step"] += 1
 
-                step_size = group["lr"]
+                # Bias correction (Listing 1 style: apply in subspace)
                 if group["correct_bias"]:
                     bias_correction1 = 1.0 - beta1 ** state["step"]
                     bias_correction2 = 1.0 - beta2 ** state["step"]
-                    step_size = step_size * math.sqrt(bias_correction2) / bias_correction1
+                    # Apply correction directly to exp_avg and exp_avg_sq
+                    exp_avg_corrected = exp_avg / bias_correction1
+                    exp_avg_sq_corrected = exp_avg_sq / bias_correction2
+                else:
+                    exp_avg_corrected = exp_avg
+                    exp_avg_sq_corrected = exp_avg_sq
 
                 # Compute normalized gradient (in subspace for 2D)
-                norm_grad = exp_avg / denom
+                denom = exp_avg_sq_corrected.sqrt().add_(group["eps"])
+                norm_grad = exp_avg_corrected / denom
                 
                 # Project back to parameter space (only for 2D parameters)
                 # This is the ACTUAL update that Conda will apply to parameters
@@ -133,7 +145,8 @@ class Conda(Optimizer):
                 # =========================================
 
                 # Apply Conda update: x_{t+1} = x_t - η_t * u_t
-                p.add_(norm_grad, alpha=-step_size)
+                # Use base learning rate (no bias correction on step_size)
+                p.add_(norm_grad, alpha=-group["lr"])
                 
         return loss
     
@@ -145,13 +158,14 @@ class Conda(Optimizer):
         
         # Update orthogonal matrix if needed
         if update_condition and not already_updated_this_step:
-            # Determine projection type based on shape (std behavior)
-            if input_matrix.shape[0] >= input_matrix.shape[1]:
-                state["projector_ortho"] = self._get_orthogonal_matrix(svd_basis_matrix, type='right')
-                state["projector_type"] = 'right'
-            else:
+            # Determine projection type based on shape (Listing 1 logic)
+            # m <= n: left projection (U), m > n: right projection (Vh)
+            if input_matrix.shape[0] <= input_matrix.shape[1]:
                 state["projector_ortho"] = self._get_orthogonal_matrix(svd_basis_matrix, type='left')
                 state["projector_type"] = 'left'
+            else:
+                state["projector_ortho"] = self._get_orthogonal_matrix(svd_basis_matrix, type='right')
+                state["projector_type"] = 'right'
             
             state["projector_last_svd_step"] = state["step"]
         
